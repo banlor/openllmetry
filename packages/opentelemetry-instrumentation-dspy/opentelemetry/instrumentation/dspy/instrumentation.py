@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+from importlib import import_module
 from typing import Collection
 
 from wrapt import wrap_function_wrapper
@@ -22,6 +23,7 @@ from .utils import (
     messages_to_otel_input,
     response_to_otel_output,
     set_span_attribute,
+    should_send_prompts,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,21 +36,21 @@ _DSPY_CACHE_HIT = "dspy.cache_hit"
 # Maps LiteLLM vendor prefixes (e.g. "openai" in "openai/gpt-4") to OTel provider name values.
 # Uses GenAISystem (semconv-ai) and GenAiSystemValues (OTel upstream) — no raw strings.
 _LITELLM_PREFIX_TO_OTEL_PROVIDER = {
-    "openai":    GenAISystem.OPENAI.value,
+    "openai": GenAISystem.OPENAI.value,
     "anthropic": GenAISystem.ANTHROPIC.value,
-    "gemini":    GenAiSystemValues.GCP_GEMINI.value,
+    "gemini": GenAiSystemValues.GCP_GEMINI.value,
     "vertex_ai": GenAiSystemValues.GCP_VERTEX_AI.value,
-    "bedrock":   GenAISystem.AWS.value,
-    "azure":     GenAiSystemValues.AZURE_AI_OPENAI.value,
-    "groq":      GenAISystem.GROQ.value,
-    "mistral":   GenAISystem.MISTRALAI.value,
-    "cohere":    GenAISystem.COHERE.value,
-    "ollama":    GenAISystem.OLLAMA.value,
+    "bedrock": GenAISystem.AWS.value,
+    "azure": GenAiSystemValues.AZURE_AI_OPENAI.value,
+    "groq": GenAISystem.GROQ.value,
+    "mistral": GenAISystem.MISTRALAI.value,
+    "cohere": GenAISystem.COHERE.value,
+    "ollama": GenAISystem.OLLAMA.value,
 }
 
 _MODEL_PATTERN_TO_OTEL_PROVIDER = [
-    ("claude",  GenAISystem.ANTHROPIC.value),
-    ("gemini",  GenAiSystemValues.GCP_GEMINI.value),
+    ("claude", GenAISystem.ANTHROPIC.value),
+    ("gemini", GenAiSystemValues.GCP_GEMINI.value),
     ("mistral", GenAISystem.MISTRALAI.value),
     ("command", GenAISystem.COHERE.value),
 ]
@@ -61,7 +63,7 @@ def _infer_provider(model: object | None) -> str | None:
     if "/" in s:
         return _LITELLM_PREFIX_TO_OTEL_PROVIDER.get(s.split("/")[0].lower())
     lower = s.lower()
-    if lower.startswith(("gpt-", "o1", "o3", "o4")):
+    if lower.startswith(("gpt-", "o1-", "o3-", "o4-")) or lower in {"o1", "o3", "o4"}:
         return GenAISystem.OPENAI.value
     for pattern, provider in _MODEL_PATTERN_TO_OTEL_PROVIDER:
         if pattern in lower:
@@ -70,7 +72,6 @@ def _infer_provider(model: object | None) -> str | None:
 
 
 class DSPyInstrumentor(BaseInstrumentor):
-
     def instrumentation_dependencies(self) -> Collection[str]:
         return _instruments
 
@@ -85,35 +86,70 @@ class DSPyInstrumentor(BaseInstrumentor):
         if is_metrics_enabled():
             token_histogram, duration_histogram = _create_metrics(meter)
 
-        wrap_function_wrapper(
-            "dspy.clients.lm", "LM.forward",
+        if _wrap_if_available(
+            "dspy.clients.lm",
+            "LM",
+            "forward",
             wrap_lm_forward(tracer, duration_histogram, token_histogram),
-        )
-        wrap_function_wrapper(
-            "dspy.clients.lm", "LM.aforward",
-            wrap_lm_aforward(tracer, duration_histogram, token_histogram),
-        )
-        wrap_function_wrapper(
-            "dspy.predict.predict", "Predict.forward",
+        ):
+            _wrap_if_available(
+                "dspy.clients.lm",
+                "LM",
+                "aforward",
+                wrap_lm_aforward(tracer, duration_histogram, token_histogram),
+            )
+        else:
+            _wrap_if_available(
+                "dspy.clients.lm",
+                "LM",
+                "__call__",
+                wrap_lm_forward(tracer, duration_histogram, token_histogram),
+            )
+        _wrap_if_available(
+            "dspy.predict.predict",
+            "Predict",
+            "forward",
             wrap_predict_forward(tracer),
         )
-        wrap_function_wrapper(
-            "dspy.predict.predict", "Predict.aforward",
+        _wrap_if_available(
+            "dspy.predict.predict",
+            "Predict",
+            "aforward",
             wrap_predict_aforward(tracer),
         )
 
     def _uninstrument(self, **kwargs):
-        unwrap("dspy.clients.lm.LM", "forward")
-        unwrap("dspy.clients.lm.LM", "aforward")
-        unwrap("dspy.predict.predict.Predict", "forward")
-        unwrap("dspy.predict.predict.Predict", "aforward")
+        if _unwrap_if_available("dspy.clients.lm", "LM", "forward"):
+            _unwrap_if_available("dspy.clients.lm", "LM", "aforward")
+        else:
+            _unwrap_if_available("dspy.clients.lm", "LM", "__call__")
+        _unwrap_if_available("dspy.predict.predict", "Predict", "forward")
+        _unwrap_if_available("dspy.predict.predict", "Predict", "aforward")
+
+
+def _wrap_if_available(module_name, class_name, method_name, wrapper):
+    target_class = getattr(import_module(module_name), class_name, None)
+    if target_class is not None and hasattr(target_class, method_name):
+        wrap_function_wrapper(module_name, f"{class_name}.{method_name}", wrapper)
+        return True
+    return False
+
+
+def _unwrap_if_available(module_name, class_name, method_name):
+    target_class = getattr(import_module(module_name), class_name, None)
+    if target_class is not None and hasattr(target_class, method_name):
+        unwrap(f"{module_name}.{class_name}", method_name)
+        return True
+    return False
 
 
 def with_tracer_wrapper(func):
     def _with_tracer(tracer, duration_histogram, token_histogram):
         def wrapper(wrapped, instance, args, kwargs):
             return func(tracer, duration_histogram, token_histogram, wrapped, instance, args, kwargs)
+
         return wrapper
+
     return _with_tracer
 
 
@@ -121,7 +157,9 @@ def with_tracer_async_wrapper(func):
     def _with_tracer(tracer, duration_histogram, token_histogram):
         async def wrapper(wrapped, instance, args, kwargs):
             return await func(tracer, duration_histogram, token_histogram, wrapped, instance, args, kwargs)
+
         return wrapper
+
     return _with_tracer
 
 
@@ -129,7 +167,9 @@ def with_predict_tracer_wrapper(func):
     def _with_tracer(tracer):
         def wrapper(wrapped, instance, args, kwargs):
             return func(tracer, wrapped, instance, args, kwargs)
+
         return wrapper
+
     return _with_tracer
 
 
@@ -137,7 +177,9 @@ def with_predict_tracer_async_wrapper(func):
     def _with_tracer(tracer):
         async def wrapper(wrapped, instance, args, kwargs):
             return await func(tracer, wrapped, instance, args, kwargs)
+
         return wrapper
+
     return _with_tracer
 
 
@@ -159,27 +201,42 @@ def _lm_span_name(instance, model: object | None) -> str:
 
 def _extract_messages(args, kwargs):
     messages = kwargs.get("messages")
+    if messages is None and len(args) > 1:
+        messages = args[1]
     if messages:
         return messages
+
     prompt = kwargs.get("prompt")
+    if prompt is None and args:
+        prompt = args[0]
     if prompt:
         return [{"role": "user", "content": prompt}]
     return None
 
 
 @with_tracer_wrapper
-def wrap_lm_forward(tracer: Tracer, duration_histogram: Histogram, token_histogram: Histogram,
-                    wrapped, instance, args, kwargs):
+def wrap_lm_forward(
+    tracer: Tracer,
+    duration_histogram: Histogram | None,
+    token_histogram: Histogram | None,
+    wrapped,
+    instance,
+    args,
+    kwargs,
+):
     model = getattr(instance, "model", None)
     provider = _infer_provider(model)
 
     with tracer.start_as_current_span(
-        _lm_span_name(instance, model), kind=SpanKind.CLIENT, attributes=_lm_span_attrs(model, provider),
+        _lm_span_name(instance, model),
+        kind=SpanKind.CLIENT,
+        attributes=_lm_span_attrs(model, provider),
     ) as span:
         messages = _extract_messages(args, kwargs)
-        input_json = messages_to_otel_input(messages)
-        if input_json:
-            set_span_attribute(span, GenAIAttributes.GEN_AI_INPUT_MESSAGES, input_json)
+        if should_send_prompts():
+            input_json = messages_to_otel_input(messages)
+            if input_json:
+                set_span_attribute(span, GenAIAttributes.GEN_AI_INPUT_MESSAGES, input_json)
 
         start = time.time()
         try:
@@ -193,18 +250,28 @@ def wrap_lm_forward(tracer: Tracer, duration_histogram: Histogram, token_histogr
 
 
 @with_tracer_async_wrapper
-async def wrap_lm_aforward(tracer: Tracer, duration_histogram: Histogram, token_histogram: Histogram,
-                           wrapped, instance, args, kwargs):
+async def wrap_lm_aforward(
+    tracer: Tracer,
+    duration_histogram: Histogram | None,
+    token_histogram: Histogram | None,
+    wrapped,
+    instance,
+    args,
+    kwargs,
+):
     model = getattr(instance, "model", None)
     provider = _infer_provider(model)
 
     with tracer.start_as_current_span(
-        _lm_span_name(instance, model), kind=SpanKind.CLIENT, attributes=_lm_span_attrs(model, provider),
+        _lm_span_name(instance, model),
+        kind=SpanKind.CLIENT,
+        attributes=_lm_span_attrs(model, provider),
     ) as span:
         messages = _extract_messages(args, kwargs)
-        input_json = messages_to_otel_input(messages)
-        if input_json:
-            set_span_attribute(span, GenAIAttributes.GEN_AI_INPUT_MESSAGES, input_json)
+        if should_send_prompts():
+            input_json = messages_to_otel_input(messages)
+            if input_json:
+                set_span_attribute(span, GenAIAttributes.GEN_AI_INPUT_MESSAGES, input_json)
 
         start = time.time()
         try:
@@ -217,8 +284,7 @@ async def wrap_lm_aforward(tracer: Tracer, duration_histogram: Histogram, token_
         return result
 
 
-def _safe_set_lm_span_output(span, result, model, provider,
-                             duration_histogram, token_histogram, start):
+def _safe_set_lm_span_output(span, result, model, provider, duration_histogram, token_histogram, start):
     """Telemetry must never break the user's call; swallow post-call errors."""
     try:
         _set_lm_span_output(span, result, model, provider, duration_histogram, token_histogram, start)
@@ -262,11 +328,11 @@ async def wrap_predict_aforward(tracer: Tracer, wrapped, instance, args, kwargs)
         return result
 
 
-def _set_lm_span_output(span, result, model, provider,
-                        duration_histogram, token_histogram, start):
-    output_json = response_to_otel_output(result)
-    if output_json:
-        set_span_attribute(span, GenAIAttributes.GEN_AI_OUTPUT_MESSAGES, output_json)
+def _set_lm_span_output(span, result, model, provider, duration_histogram, token_histogram, start):
+    if should_send_prompts():
+        output_json = response_to_otel_output(result)
+        if output_json:
+            set_span_attribute(span, GenAIAttributes.GEN_AI_OUTPUT_MESSAGES, output_json)
 
     response_model = getattr(result, "model", None) or model
     set_span_attribute(span, GenAIAttributes.GEN_AI_RESPONSE_MODEL, response_model)
