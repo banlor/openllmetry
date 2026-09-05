@@ -5,10 +5,11 @@ from importlib import import_module
 from typing import Collection
 
 from wrapt import wrap_function_wrapper
+from opentelemetry import context as context_api
 from opentelemetry.trace import SpanKind, Tracer, get_tracer
 from opentelemetry.trace.status import Status, StatusCode
 from opentelemetry.metrics import Histogram, Meter, get_meter
-from opentelemetry.instrumentation.utils import unwrap
+from opentelemetry.instrumentation.utils import _SUPPRESS_INSTRUMENTATION_KEY, unwrap
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
 from opentelemetry.instrumentation.dspy.version import __version__
 from opentelemetry.semconv._incubating.attributes import gen_ai_attributes as GenAIAttributes
@@ -16,7 +17,13 @@ from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
     GenAiOperationNameValues,
     GenAiSystemValues,
 )
-from opentelemetry.semconv_ai import GenAISystem, Meters, SpanAttributes, TraceloopSpanKindValues
+from opentelemetry.semconv_ai import (
+    SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
+    GenAISystem,
+    Meters,
+    SpanAttributes,
+    TraceloopSpanKindValues,
+)
 
 from .utils import (
     get_token_usage,
@@ -224,6 +231,11 @@ def wrap_lm_forward(
     args,
     kwargs,
 ):
+    if context_api.get_value(_SUPPRESS_INSTRUMENTATION_KEY) or context_api.get_value(
+        SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY
+    ):
+        return wrapped(*args, **kwargs)
+
     model = getattr(instance, "model", None)
     provider = _infer_provider(model)
 
@@ -259,6 +271,11 @@ async def wrap_lm_aforward(
     args,
     kwargs,
 ):
+    if context_api.get_value(_SUPPRESS_INSTRUMENTATION_KEY) or context_api.get_value(
+        SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY
+    ):
+        return await wrapped(*args, **kwargs)
+
     model = getattr(instance, "model", None)
     provider = _infer_provider(model)
 
@@ -294,6 +311,9 @@ def _safe_set_lm_span_output(span, result, model, provider, duration_histogram, 
 
 @with_predict_tracer_wrapper
 def wrap_predict_forward(tracer: Tracer, wrapped, instance, args, kwargs):
+    if context_api.get_value(_SUPPRESS_INSTRUMENTATION_KEY):
+        return wrapped(*args, **kwargs)
+
     sig_name = _signature_name(instance)
     with tracer.start_as_current_span(
         f"{sig_name}.predict",
@@ -312,6 +332,9 @@ def wrap_predict_forward(tracer: Tracer, wrapped, instance, args, kwargs):
 
 @with_predict_tracer_async_wrapper
 async def wrap_predict_aforward(tracer: Tracer, wrapped, instance, args, kwargs):
+    if context_api.get_value(_SUPPRESS_INSTRUMENTATION_KEY):
+        return await wrapped(*args, **kwargs)
+
     sig_name = _signature_name(instance)
     with tracer.start_as_current_span(
         f"{sig_name}.predict",
